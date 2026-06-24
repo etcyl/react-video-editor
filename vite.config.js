@@ -10,6 +10,9 @@ const coiHeaders = {
 }
 
 export default defineConfig({
+  // Relative base so the production build works under a GitHub Pages subpath
+  // (https://<user>.github.io/react-video-editor/) as well as at the root.
+  base: './',
   plugins: [react()],
   server: { headers: coiHeaders },
   preview: { headers: coiHeaders },

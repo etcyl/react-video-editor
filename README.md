@@ -6,7 +6,12 @@ and crossfade transitions, then export a real video file at the source resolutio
 (2K in, 2K out) using ffmpeg.wasm. Everything runs locally in the browser. No
 uploads, no server.
 
+**Live demo:** https://etcyl.github.io/react-video-editor/
+
 ![React Video Editor](docs/screenshot.png)
+
+> The hosted demo runs the single threaded ffmpeg core, so export works but is CPU
+> bound. The first export downloads the ffmpeg core (about 32 MB), then it is cached.
 
 ## Features
 
