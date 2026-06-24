@@ -1,0 +1,457 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>React Video Editor (standalone)</title>
+  <link rel="stylesheet" href="src/styles.css" />
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel" data-type="module">
+const { useCallback, useEffect, useMemo, useRef, useState } = React
+
+/* ---------------- model ---------------- */
+let idCounter = 0
+const uid = (p = 'id') => `${p}_${++idCounter}_${Math.floor(performance.now())}`
+const clipDuration = (c) => c.out - c.in
+const clipEnd = (c) => c.start + clipDuration(c)
+const MIN_DUR = 0.05
+
+function clipsFromSource(source, start) {
+  const groupId = uid('grp')
+  const base = { groupId, sourceId: source.id, in: 0, out: source.duration, start }
+  return [
+    { ...base, id: uid('clip'), kind: 'video' },
+    { ...base, id: uid('clip'), kind: 'audio' },
+  ]
+}
+function trimLeft(clip, tAbs) {
+  const earliest = clip.start - clip.in
+  const latest = clipEnd(clip) - MIN_DUR
+  const newStart = Math.min(Math.max(tAbs, earliest), latest)
+  const delta = newStart - clip.start
+  return { ...clip, start: newStart, in: clip.in + delta }
+}
+function trimRight(clip, tAbs, srcDuration) {
+  const maxEnd = clip.start + (srcDuration - clip.in)
+  const newEnd = Math.min(Math.max(tAbs, clip.start + MIN_DUR), maxEnd)
+  return { ...clip, out: clip.in + (newEnd - clip.start) }
+}
+function splitClip(clip, t) {
+  if (t <= clip.start + 1e-4 || t >= clipEnd(clip) - 1e-4) return null
+  const cutSource = clip.in + (t - clip.start)
+  return [
+    { ...clip, id: uid('clip'), out: cutSource },
+    { ...clip, id: uid('clip'), in: cutSource, start: t },
+  ]
+}
+const clipAt = (clips, kind, t) => clips.find((c) => c.kind === kind && t > c.start + 1e-4 && t < clipEnd(c) - 1e-4)
+const tracksOf = (clips, kind) => clips.filter((c) => c.kind === kind).sort((a, b) => a.start - b.start)
+const timelineDuration = (clips) => clips.reduce((m, c) => Math.max(m, clipEnd(c)), 0)
+
+/* ---------------- media ---------------- */
+function probeFile(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file)
+    const v = document.createElement('video')
+    v.preload = 'metadata'
+    v.onloadedmetadata = () => resolve({ name: file.name, file, url, duration: v.duration, width: v.videoWidth, height: v.videoHeight })
+    v.onerror = () => reject(new Error('Could not read ' + file.name))
+    v.src = url
+  })
+}
+const fmtTime = (s) => {
+  if (!isFinite(s)) return '0:00'
+  const m = Math.floor(s / 60), sec = Math.floor(s % 60), ms = Math.floor((s % 1) * 100)
+  return `${m}:${String(sec).padStart(2, '0')}.${String(ms).padStart(2, '0')}`
+}
+
+/* ---------------- exporter ---------------- */
+const FORMATS = {
+  mp4:  { label: 'MP4 (H.264 / AAC)',  ext: 'mp4', v: 'libx264',     a: 'aac',     va: ['-pix_fmt','yuv420p','-preset','medium'], vq: ['-crf','18'], aq: ['-b:a','320k'] },
+  mov:  { label: 'MOV (H.264 / AAC)',  ext: 'mov', v: 'libx264',     a: 'aac',     va: ['-pix_fmt','yuv420p','-preset','medium'], vq: ['-crf','18'], aq: ['-b:a','320k'] },
+  mkv:  { label: 'MKV (H.264 / AAC)',  ext: 'mkv', v: 'libx264',     a: 'aac',     va: ['-pix_fmt','yuv420p','-preset','medium'], vq: ['-crf','18'], aq: ['-b:a','320k'] },
+  webm: { label: 'WebM (VP9 / Opus)',  ext: 'webm', v: 'libvpx-vp9', a: 'libopus', va: [], vq: ['-crf','24','-b:v','0'], aq: ['-b:a','256k'] },
+}
+let ffmpeg = null, ffUtil = null
+async function getFfmpeg(onLog) {
+  if (ffmpeg) return ffmpeg
+  const mod = await import('https://esm.sh/@ffmpeg/ffmpeg@0.12.10')
+  ffUtil = await import('https://esm.sh/@ffmpeg/util@0.12.1')
+  ffmpeg = new mod.FFmpeg()
+  if (onLog) ffmpeg.on('log', ({ message }) => onLog(message))
+  const base = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm'
+  await ffmpeg.load({
+    coreURL: await ffUtil.toBlobURL(base + '/ffmpeg-core.js', 'text/javascript'),
+    wasmURL: await ffUtil.toBlobURL(base + '/ffmpeg-core.wasm', 'application/wasm'),
+  })
+  return ffmpeg
+}
+function buildTrack(clips, inputIndexOf, kind, opts) {
+  const isV = kind === 'video'
+  const tag = isV ? 'v' : 'a'
+  const trim = isV ? 'trim' : 'atrim'
+  const setpts = isV ? 'setpts=PTS-STARTPTS' : 'asetpts=PTS-STARTPTS'
+  const filters = [], segLabels = []
+  clips.forEach((c, i) => {
+    const inIdx = inputIndexOf(c.sourceId)
+    const lbl = tag + i
+    const extra = isV ? '' : ',aformat=sample_rates=48000:channel_layouts=stereo'
+    const prevEnd = i === 0 ? 0 : clipEnd(clips[i - 1])
+    const gap = opts.crossfade ? 0 : Math.max(0, c.start - prevEnd)
+    const pad = gap > 1e-3 ? (isV ? `,tpad=start_duration=${gap.toFixed(3)}:color=black` : `,adelay=delays=${Math.round(gap*1000)}:all=1`) : ''
+    filters.push(`[${inIdx}:${tag}]${trim}=start=${c.in.toFixed(3)}:end=${c.out.toFixed(3)},${setpts}${extra}${pad}[${lbl}]`)
+    segLabels.push({ lbl, dur: gap + clipDuration(c) })
+  })
+  const D = opts.fadeDuration
+  let outLabel, total
+  if (segLabels.length === 1) { outLabel = segLabels[0].lbl; total = segLabels[0].dur }
+  else if (opts.crossfade) {
+    let prev = segLabels[0].lbl, acc = segLabels[0].dur
+    for (let i = 1; i < segLabels.length; i++) {
+      const cur = segLabels[i], off = Math.max(0, acc - D), out = 'x' + tag + i
+      filters.push(isV
+        ? `[${prev}][${cur.lbl}]xfade=transition=fade:duration=${D}:offset=${off.toFixed(3)}[${out}]`
+        : `[${prev}][${cur.lbl}]acrossfade=d=${D}[${out}]`)
+      acc = acc + cur.dur - D; prev = out
+    }
+    outLabel = prev; total = acc
+  } else {
+    const inputs = segLabels.map((s) => `[${s.lbl}]`).join(''), out = 'c' + tag
+    filters.push(`${inputs}concat=n=${segLabels.length}:v=${isV?1:0}:a=${isV?0:1}[${out}]`)
+    outLabel = out; total = segLabels.reduce((s, x) => s + x.dur, 0)
+  }
+  const fades = []
+  if (opts.introFade) fades.push(isV ? `fade=t=in:st=0:d=${D}` : `afade=t=in:st=0:d=${D}`)
+  if (opts.outroFade) { const st = Math.max(0, total - D).toFixed(3); fades.push(isV ? `fade=t=out:st=${st}:d=${D}` : `afade=t=out:st=${st}:d=${D}`) }
+  if (fades.length) { const out = tag + 'fin'; filters.push(`[${outLabel}]${fades.join(',')}[${out}]`); outLabel = out }
+  return { filters, out: outLabel, total }
+}
+async function exportTimeline({ clips, sources, transitions, formatKey, onLog, onProgress }) {
+  const fmt = FORMATS[formatKey] || FORMATS.mp4
+  const vClips = tracksOf(clips, 'video'), aClips = tracksOf(clips, 'audio')
+  if (!vClips.length && !aClips.length) throw new Error('Timeline is empty.')
+  const ff = await getFfmpeg(onLog)
+  if (onProgress) ff.on('progress', ({ progress }) => onProgress(Math.min(1, Math.max(0, progress))))
+  const usedIds = [...new Set(clips.map((c) => c.sourceId))]
+  const inputArgs = [], idToIndex = new Map()
+  for (let i = 0; i < usedIds.length; i++) {
+    const src = sources.find((s) => s.id === usedIds[i])
+    const fname = `in${i}.${src.name.split('.').pop() || 'mp4'}`
+    await ff.writeFile(fname, await ffUtil.fetchFile(src.file))
+    inputArgs.push('-i', fname); idToIndex.set(src.id, i)
+  }
+  const inputIndexOf = (id) => idToIndex.get(id)
+  const filterParts = [], maps = []
+  if (vClips.length) { const v = buildTrack(vClips, inputIndexOf, 'video', transitions); filterParts.push(...v.filters); maps.push('-map', `[${v.out}]`) }
+  if (aClips.length) { const a = buildTrack(aClips, inputIndexOf, 'audio', transitions); filterParts.push(...a.filters); maps.push('-map', `[${a.out}]`) }
+  const outName = 'output.' + fmt.ext
+  const args = [...inputArgs, '-filter_complex', filterParts.join(';'), ...maps]
+  if (vClips.length) args.push('-c:v', fmt.v, ...fmt.va, ...fmt.vq)
+  if (aClips.length) args.push('-c:a', fmt.a, ...fmt.aq)
+  args.push('-movflags', '+faststart', outName)
+  onLog && onLog('ffmpeg ' + args.join(' '))
+  await ff.exec(args)
+  const data = await ff.readFile(outName)
+  const mime = fmt.ext === 'webm' ? 'video/webm' : fmt.ext === 'mov' ? 'video/quicktime' : 'video/mp4'
+  return { blob: new Blob([data.buffer], { type: mime }), ext: fmt.ext }
+}
+
+/* ---------------- Dropzone ---------------- */
+function Dropzone({ onFiles, compact }) {
+  const [hover, setHover] = useState(false)
+  const inputRef = useRef(null)
+  const pick = (list) => {
+    const files = [...list].filter((f) => f.type.startsWith('video/') || /\.(mp4|mov|mkv|webm|avi|m4v)$/i.test(f.name))
+    if (files.length) onFiles(files)
+  }
+  return (
+    <div className={`dropzone ${compact ? 'compact' : ''} ${hover ? 'hover' : ''}`}
+      onDragOver={(e) => { e.preventDefault(); setHover(true) }}
+      onDragLeave={() => setHover(false)}
+      onDrop={(e) => { e.preventDefault(); setHover(false); pick(e.dataTransfer.files) }}
+      onClick={() => inputRef.current?.click()}>
+      <input ref={inputRef} type="file" accept="video/*" multiple hidden
+        onChange={(e) => { pick(e.target.files); e.target.value = '' }} />
+      {compact ? <span>+ Drop or click to add more video</span>
+        : <div className="dz-big"><div className="dz-icon">⤓</div><strong>Drag & drop a video here</strong><span>or click to browse. MP4, MOV, MKV, WebM.</span></div>}
+    </div>
+  )
+}
+
+/* ---------------- Preview ---------------- */
+function Preview({ sources, clips, playhead, playing, duration, transitions, onTime, onTogglePlay, onEnded }) {
+  const videoRef = useRef(null)
+  const state = useRef({})
+  state.current = { sources, clips, playhead, duration, transitions }
+  const activeVideoClip = (t) => tracksOf(state.current.clips, 'video').find((c) => t >= c.start - 1e-3 && t < clipEnd(c) - 1e-3) || null
+  const srcUrl = (id) => state.current.sources.find((s) => s.id === id)?.url
+  useEffect(() => {
+    const v = videoRef.current; if (!v) return
+    const clip = activeVideoClip(playhead); if (!clip) return
+    const url = srcUrl(clip.sourceId)
+    if (v.dataset.url !== url) { v.src = url; v.dataset.url = url }
+    const want = clip.in + (playhead - clip.start)
+    if (Math.abs(v.currentTime - want) > 0.25 || v.paused) { try { v.currentTime = Math.min(want, v.duration || want) } catch {} }
+  }, [playhead, clips, sources])
+  useEffect(() => {
+    const v = videoRef.current; if (!v) return
+    let raf
+    if (playing) {
+      const clip = activeVideoClip(state.current.playhead); if (clip) v.play().catch(() => {})
+      const tick = () => {
+        const { playhead: ph, duration: dur } = state.current
+        const c = activeVideoClip(ph)
+        if (c && !v.paused) {
+          let t = c.start + (v.currentTime - c.in)
+          if (v.currentTime >= c.out - 1e-2 || v.ended) t = clipEnd(c) + 1e-3
+          if (t >= dur - 1e-3) { onTime(dur); onEnded(); return }
+          onTime(t)
+        } else {
+          const t = ph + 1 / 60
+          if (t >= dur - 1e-3) { onTime(dur); onEnded(); return }
+          onTime(t)
+        }
+        raf = requestAnimationFrame(tick)
+      }
+      raf = requestAnimationFrame(tick)
+    } else v.pause()
+    return () => raf && cancelAnimationFrame(raf)
+  }, [playing])
+  const fadeAlpha = (() => {
+    const { fadeDuration: D, introFade, outroFade } = transitions
+    if (introFade && playhead < D) return 1 - playhead / D
+    if (outroFade && playhead > duration - D && duration > 0) return 1 - (duration - playhead) / D
+    return 0
+  })()
+  return (
+    <div className="preview">
+      <div className="screen">
+        <video ref={videoRef} playsInline />
+        <div className="fade-overlay" style={{ opacity: Math.max(0, Math.min(1, fadeAlpha)) }} />
+      </div>
+      <div className="preview-bar">
+        <button onClick={onTogglePlay}>{playing ? '❚❚' : '►'}</button>
+        <span className="tc">{fmtTime(playhead)} / {fmtTime(duration)}</span>
+      </div>
+    </div>
+  )
+}
+
+/* ---------------- TransitionPanel ---------------- */
+function TransitionPanel({ value, onChange }) {
+  const set = (patch) => onChange({ ...value, ...patch })
+  return (
+    <div className="transitions">
+      <h3>Transitions</h3>
+      <label className="cb"><input type="checkbox" checked={value.introFade} onChange={(e) => set({ introFade: e.target.checked })} /> Fade in (intro)</label>
+      <label className="cb"><input type="checkbox" checked={value.outroFade} onChange={(e) => set({ outroFade: e.target.checked })} /> Fade out (outro)</label>
+      <label className="cb"><input type="checkbox" checked={value.crossfade} onChange={(e) => set({ crossfade: e.target.checked })} /> Crossfade between clips</label>
+      <label className="range">Fade length: {value.fadeDuration.toFixed(1)}s
+        <input type="range" min="0.2" max="3" step="0.1" value={value.fadeDuration} onChange={(e) => set({ fadeDuration: +e.target.value })} />
+      </label>
+      <p className="hint">Checked transitions apply on export: intro/outro fades plus a dissolve where clips meet.</p>
+    </div>
+  )
+}
+
+/* ---------------- Toolbar ---------------- */
+function Toolbar({ tool, setTool, playing, onTogglePlay, pps, setPps, playhead, duration, selectedId, onDelete }) {
+  return (
+    <div className="toolbar">
+      <div className="group">
+        <button className={tool === 'move' ? 'active' : ''} onClick={() => setTool('move')} title="Move clips (V)">✥ Move</button>
+        <button className={tool === 'cut' ? 'active' : ''} onClick={() => setTool('cut')} title="Cut at playhead (C)">✂ Cut</button>
+      </div>
+      <div className="group">
+        <button onClick={onTogglePlay}>{playing ? '❚❚ Pause' : '► Play'}</button>
+        <span className="tc">{fmtTime(playhead)} / {fmtTime(duration)}</span>
+      </div>
+      <div className="group"><label>Zoom</label><input type="range" min="20" max="240" value={pps} onChange={(e) => setPps(+e.target.value)} /></div>
+      <div className="group right"><button disabled={!selectedId} onClick={() => selectedId && onDelete(selectedId)} title="Delete selected clip (Del)">🗑 Delete clip</button></div>
+    </div>
+  )
+}
+
+/* ---------------- Timeline ---------------- */
+function Timeline({ clips, sources, pps, playhead, tool, selectedId, duration, transitions, onSelect, onSeek, onTrackClick, onMove, onTrim }) {
+  const scrollRef = useRef(null)
+  const contentW = Math.max((duration + 4) * pps, 600)
+  const nameOf = (id) => sources.find((s) => s.id === id)?.name || ''
+  const timeFromEvent = (e) => {
+    const el = scrollRef.current, rect = el.getBoundingClientRect()
+    return Math.max(0, (e.clientX - rect.left + el.scrollLeft) / pps)
+  }
+  const onLaneMouseDown = (e, kind) => {
+    if (e.target.dataset.clip) return
+    const t = timeFromEvent(e)
+    if (tool === 'cut') onTrackClick(kind, t); else onSeek(t)
+  }
+  const startDrag = (e, clip) => {
+    e.stopPropagation(); onSelect(clip.id)
+    if (tool === 'cut') { onTrackClick(clip.kind, timeFromEvent(e)); return }
+    const startX = e.clientX, origStart = clip.start
+    const move = (ev) => onMove(clip.id, Math.max(0, origStart + (ev.clientX - startX) / pps))
+    const up = () => { window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up) }
+    window.addEventListener('mousemove', move); window.addEventListener('mouseup', up)
+  }
+  const startTrim = (e, clip, edge) => {
+    e.stopPropagation(); onSelect(clip.id)
+    const move = (ev) => onTrim(clip.id, edge, timeFromEvent(ev))
+    const up = () => { window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up) }
+    window.addEventListener('mousemove', move); window.addEventListener('mouseup', up)
+  }
+  const step = pps < 50 ? 5 : pps < 120 ? 2 : 1
+  const ticks = []
+  for (let t = 0; t <= duration + 4; t += step) ticks.push(t)
+  const LANES = [{ kind: 'video', label: 'V' }, { kind: 'audio', label: 'A' }]
+  return (
+    <div className={`timeline tool-${tool}`} ref={scrollRef}>
+      <div className="tl-content" style={{ width: contentW }}>
+        <div className="ruler" onMouseDown={(e) => onSeek(timeFromEvent(e))}>
+          {ticks.map((t) => <div key={t} className="tick" style={{ left: t * pps }}><span>{t}s</span></div>)}
+        </div>
+        {LANES.map(({ kind, label }) => {
+          const lane = tracksOf(clips, kind)
+          return (
+            <div key={kind} className={`lane lane-${kind}`} onMouseDown={(e) => onLaneMouseDown(e, kind)}>
+              <div className="lane-label">{label}</div>
+              {lane.map((c, i) => {
+                const left = c.start * pps, w = clipDuration(c) * pps, prev = lane[i - 1]
+                const joins = transitions.crossfade && prev && Math.abs(clipEnd(prev) - c.start) < 0.05
+                return (
+                  <div key={c.id} data-clip="1" className={`clip ${selectedId === c.id ? 'sel' : ''}`}
+                    style={{ left, width: Math.max(2, w) }} onMouseDown={(e) => startDrag(e, c)}
+                    title={`${nameOf(c.sourceId)}  ${clipDuration(c).toFixed(2)}s`}>
+                    {transitions.introFade && i === 0 && <span className="fade-in-mark" />}
+                    {transitions.outroFade && i === lane.length - 1 && <span className="fade-out-mark" />}
+                    {joins && <span className="xfade-mark" />}
+                    <span className="clip-name">{nameOf(c.sourceId)}</span>
+                    <span className="trim-handle left" data-clip="1" onMouseDown={(e) => startTrim(e, c, 'left')} />
+                    <span className="trim-handle right" data-clip="1" onMouseDown={(e) => startTrim(e, c, 'right')} />
+                  </div>
+                )
+              })}
+            </div>
+          )
+        })}
+        <div className="playhead" style={{ left: playhead * pps }} />
+      </div>
+    </div>
+  )
+}
+
+/* ---------------- App ---------------- */
+function App() {
+  const [sources, setSources] = useState([])
+  const [clips, setClips] = useState([])
+  const [tool, setTool] = useState('move')
+  const [playhead, setPlayhead] = useState(0)
+  const [playing, setPlaying] = useState(false)
+  const [selectedId, setSelectedId] = useState(null)
+  const [pps, setPps] = useState(80)
+  const [transitions, setTransitions] = useState({ introFade: true, outroFade: true, crossfade: true, fadeDuration: 0.8 })
+  const [formatKey, setFormatKey] = useState('mp4')
+  const [exporting, setExporting] = useState(false)
+  const [progress, setProgress] = useState(0)
+  const [status, setStatus] = useState('')
+  const logRef = useRef('')
+  const duration = useMemo(() => timelineDuration(clips), [clips])
+
+  const onDropFiles = useCallback(async (files) => {
+    const probed = []
+    for (const f of files) { try { probed.push(await probeFile(f)) } catch (e) { setStatus(e.message) } }
+    if (!probed.length) return
+    const newSources = probed.map((p) => ({ id: uid('src'), ...p }))
+    setSources((prev) => [...prev, ...newSources])
+    setClips((prev) => {
+      let end = timelineDuration(prev); const added = []
+      for (const src of newSources) { added.push(...clipsFromSource(src, end)); end += src.duration }
+      return [...prev, ...added]
+    })
+  }, [])
+
+  const cutAt = useCallback((kind, t) => {
+    setClips((prev) => {
+      const target = clipAt(prev, kind, t); if (!target) return prev
+      const pair = splitClip(target, t); if (!pair) return prev
+      return prev.flatMap((c) => (c.id === target.id ? pair : c))
+    })
+  }, [])
+  const moveClip = useCallback((id, newStart) => setClips((prev) => prev.map((c) => (c.id === id ? { ...c, start: Math.max(0, newStart) } : c))), [])
+  const trimClip = useCallback((id, edge, tAbs) => {
+    setClips((prev) => prev.map((c) => {
+      if (c.id !== id) return c
+      const src = sources.find((s) => s.id === c.sourceId)
+      return edge === 'left' ? trimLeft(c, tAbs) : trimRight(c, tAbs, src?.duration ?? c.out)
+    }))
+  }, [sources])
+  const deleteClip = useCallback((id) => { setClips((prev) => prev.filter((c) => c.id !== id)); setSelectedId((s) => (s === id ? null : s)) }, [])
+  const onTimelineClick = useCallback((kind, t) => { if (tool === 'cut') cutAt(kind, t); else setPlayhead(t) }, [tool, cutAt])
+
+  const doExport = useCallback(async () => {
+    setExporting(true); setProgress(0); setStatus('Loading ffmpeg core...'); logRef.current = ''
+    try {
+      const { blob, ext } = await exportTimeline({ clips, sources, transitions, formatKey, onLog: (m) => { logRef.current = m }, onProgress: setProgress })
+      const url = URL.createObjectURL(blob), a = document.createElement('a')
+      a.href = url; a.download = 'export.' + ext; a.click()
+      setTimeout(() => URL.revokeObjectURL(url), 30000)
+      setStatus('Export complete.')
+    } catch (e) { console.error(e); setStatus(`Export failed: ${e.message}. ${logRef.current}`) }
+    finally { setExporting(false) }
+  }, [clips, sources, transitions, formatKey])
+
+  useEffect(() => {
+    const onKey = (e) => {
+      const tag = e.target.tagName
+      if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return
+      const k = e.key.toLowerCase()
+      if (k === 'v') setTool('move')
+      else if (k === 'c') setTool('cut')
+      else if (k === ' ') { e.preventDefault(); setPlaying((p) => !p) }
+      else if (k === 'delete' || k === 'backspace') { if (selectedId) deleteClip(selectedId) }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [selectedId, deleteClip])
+
+  const hasMedia = clips.length > 0
+  return (
+    <div className="app">
+      <header className="topbar">
+        <h1>React Video Editor</h1>
+        <div className="export-controls">
+          <select value={formatKey} onChange={(e) => setFormatKey(e.target.value)} disabled={exporting}>
+            {Object.entries(FORMATS).map(([k, f]) => <option key={k} value={k}>{f.label}</option>)}
+          </select>
+          <button className="primary" onClick={doExport} disabled={!hasMedia || exporting}>
+            {exporting ? `Exporting ${Math.round(progress * 100)}%` : 'Export'}
+          </button>
+        </div>
+      </header>
+      <div className="stage">
+        <div className="left">
+          <Preview sources={sources} clips={clips} playhead={playhead} playing={playing} duration={duration}
+            transitions={transitions} onTime={setPlayhead} onTogglePlay={() => setPlaying((p) => !p)} onEnded={() => setPlaying(false)} />
+          <TransitionPanel value={transitions} onChange={setTransitions} />
+        </div>
+        <div className="right">{!hasMedia ? <Dropzone onFiles={onDropFiles} /> : <Dropzone onFiles={onDropFiles} compact />}</div>
+      </div>
+      <Toolbar tool={tool} setTool={setTool} playing={playing} onTogglePlay={() => setPlaying((p) => !p)}
+        pps={pps} setPps={setPps} playhead={playhead} duration={duration} selectedId={selectedId} onDelete={deleteClip} />
+      <Timeline clips={clips} sources={sources} pps={pps} playhead={playhead} tool={tool} selectedId={selectedId}
+        duration={duration} transitions={transitions} onSelect={setSelectedId} onSeek={setPlayhead}
+        onTrackClick={onTimelineClick} onMove={moveClip} onTrim={trimClip} />
+      {status && <div className="status">{status}</div>}
+    </div>
+  )
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />)
+  </script>
+</body>
+</html>
